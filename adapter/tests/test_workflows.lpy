@@ -1,0 +1,147 @@
+;; comfyui adapter: workflow graph-integrity tests (coverage loop iter 9).
+;;
+;; workflows.py builds ComfyUI prompt graphs (9 builders, 449 LoC) submitted to
+;; POST /prompt. The load-bearing invariant is GRAPH INTEGRITY: every node-input
+;; reference `[node_id, slot]` must point to a node that exists in the same
+;; graph; a dangling reference makes ComfyUI reject the whole prompt. These
+;; tests check that generically across all builders, plus per-builder terminal
+;; node + parameter placement.
+;;
+;; Run: basilisp run adapter/tests/test_workflows.lpy      # exit 0 / 1
+(ns test-workflows
+  (:import json operator os sys))
+
+;; workflows.py stays Python (server.py imports it); it sits in the parent directory.
+(def adapter-dir (os.path/dirname (os.path/dirname (os.path/abspath (nth sys/argv 2)))))
+(.insert sys/path 0 adapter-dir)
+(import [workflows :as wf])
+
+(defn- expect [condition message]
+  (when-not (python/bool condition)
+    (throw (python/AssertionError message))))
+
+(defn- same [got want] (operator/eq got want))
+(defn- item [coll k] (operator/getitem coll k))
+(defn- inputs [graph node-id] (item (item graph node-id) "inputs"))
+
+(defn- wire?
+  "A wire is [str_node_id, int_slot]."
+  [v]
+  (and (python/isinstance v python/list)
+       (= 2 (python/len v))
+       (python/isinstance (item v 0) python/str)
+       (python/isinstance (item v 1) python/int)))
+
+(defn- refs
+  "Every [node_id, slot] reference found in any node's inputs."
+  [graph]
+  (vec (for [node (python/list (.values graph))
+             v    (python/list (.values (.get node "inputs" #py {})))
+             :when (wire? v)]
+         v)))
+
+(defn- assert-graph-integrity [graph]
+  (expect (and (python/isinstance graph python/dict) (python/bool graph))
+          "graph must be a non-empty dict")
+  (doseq [nid (python/list (.keys graph))]
+    (let [node (item graph nid)]
+      (expect (python/isinstance nid python/str) "node id must be a string")
+      (expect (and (operator/contains node "class_type") (python/bool (item node "class_type")))
+              (str "node " nid " missing class_type"))
+      (expect (python/isinstance (.get node "inputs" #py {}) python/dict)
+              (str "node " nid " inputs must be a dict"))))
+  (let [ids (python/set (.keys graph))]
+    (doseq [ref (refs graph)]
+      (expect (operator/contains ids (item ref 0))
+              (str "dangling reference " ref " -> no node " (item ref 0)))))
+  ;; the graph must be JSON-serializable (it is POSTed as JSON to /prompt)
+  (json/dumps graph))
+
+;; one parametrized integrity sweep over every builder
+(def all-graphs
+  [["txt2img" (wf/txt2img "ckpt.safetensors" "a cat" "bad" 832 1216 25 7.0 42)]
+   ["img2img" (wf/img2img "ckpt.safetensors" "init.png" "a cat" "bad" 0.55 25 7.0 42)]
+   ["animatediff" (wf/animatediff "ckpt" "mm.ckpt" "p" "n" 512 512 16 8 20 7.0 1)]
+   ["svd" (wf/svd "svd.safetensors" "init.png" 1024 576 14 6 127 0.0 20 2.5 3)]
+   ["wan5b_i2v" (wf/wan5b_i2v "wan5b" "init.png" "p" "n" 49 16 30 6.0 7)]
+   ["sbv2" (wf/sbv2 "jvnv" "こんにちは" "JP" 0 1.0 0.2 0.6)]
+   ["xtts" (wf/xtts "xtts_v2" "hello" "en" "spk.wav")]
+   ["musicgen" (wf/musicgen "medium" "lofi" 15.0 3.0 9)]
+   ["stable_audio" (wf/stable_audio "sa-open" "rain sfx" 8.0 50 7.0 11)]])
+
+(defn- test-every-builder-produces-an-integral-graph []
+  (doseq [[_ graph] all-graphs]
+    (assert-graph-integrity graph)))
+
+(def terminals (python/set #py ["SaveImage" "VHS_VideoCombine" "SaveAudio"]))
+
+(defn- test-each-graph-has-exactly-one-terminal-save-node []
+  (doseq [[label graph] all-graphs]
+    (let [saves (filterv #(operator/contains terminals (item % "class_type"))
+                         (python/list (.values graph)))]
+      (expect (= 1 (count saves))
+              (str label ": expected one terminal node, got " (count saves))))))
+
+;; per-builder parameter placement
+
+(defn- test-txt2img-params-land-in-the-right-nodes []
+  (let [g  (wf/txt2img "animagine.safetensors" "1girl" "lowres" 832 1216 25 7.5 12345)
+        ks (inputs g "3")]
+    (expect (same (item (inputs g "4") "ckpt_name") "animagine.safetensors") "ckpt_name")
+    (expect (same (inputs g "5") #py {"width" 832 "height" 1216 "batch_size" 1}) "latent size")
+    (expect (same (item (inputs g "6") "text") "1girl") "positive")
+    (expect (same (item (inputs g "7") "text") "lowres") "negative")
+    (expect (same #py ((item ks "seed") (item ks "steps") (item ks "cfg") (item ks "denoise"))
+                  #py (12345 25 7.5 1.0))
+            "ksampler")))
+
+(defn- test-img2img-strength-is-the-ksampler-denoise []
+  (let [g (wf/img2img "c" "photo.png" "p" "n" 0.42 30 6.0 1)]
+    (expect (same (item (inputs g "10") "image") "photo.png") "LoadImage")
+    (expect (same (item (inputs g "3") "denoise") 0.42) "strength -> denoise")
+    ;; latent comes from VAEEncode (node 11), not an empty latent
+    (expect (same (item (inputs g "3") "latent_image") #py ["11" 0]) "latent_image")))
+
+(defn- test-video-builders-carry-frame-and-fps-params []
+  (let [ad  (wf/animatediff "c" "mm" "p" "n" 768 768 24 12 20 7.0 5)
+        wan (wf/wan5b_i2v "m" "i.png" "p" "n" 49 16 30 6.0 7)]
+    (expect (same (item (inputs ad "5") "batch_size") 24) "frames -> latent batch")
+    (expect (same (item (inputs wan "22") "num_frames") 49) "num_frames")
+    (expect (same (item (inputs wan "9") "frame_rate") 16) "frame_rate")))
+
+(defn- test-xtts-omits-speaker-wav-when-absent []
+  (let [with-wav (wf/xtts "m" "hi" "en" "ref.wav")
+        without  (wf/xtts "m" "hi" "en" nil)]
+    (expect (same (item (inputs with-wav "21") "speaker_wav") "ref.wav") "speaker_wav")
+    (expect (operator/not_ (operator/contains (inputs without "21") "speaker_wav"))
+            "speaker_wav must be absent")))
+
+(defn- test-audio-builders-route-duration-and-seed []
+  (let [mg (wf/musicgen "medium" "jazz" 20.0 3.0 99)
+        sa (wf/stable_audio "open" "thunder" 5.0 60 7.0 3)]
+    (expect (same (item (inputs mg "21") "duration") 20.0) "musicgen duration")
+    (expect (same (item (inputs mg "21") "seed") 99) "musicgen seed")
+    (expect (same (item (inputs sa "21") "duration_seconds") 5.0) "stable_audio duration")
+    (expect (same (item (inputs sa "21") "steps") 60) "stable_audio steps")))
+
+(def tests
+  [["test_every_builder_produces_an_integral_graph" test-every-builder-produces-an-integral-graph]
+   ["test_each_graph_has_exactly_one_terminal_save_node" test-each-graph-has-exactly-one-terminal-save-node]
+   ["test_txt2img_params_land_in_the_right_nodes" test-txt2img-params-land-in-the-right-nodes]
+   ["test_img2img_strength_is_the_ksampler_denoise" test-img2img-strength-is-the-ksampler-denoise]
+   ["test_video_builders_carry_frame_and_fps_params" test-video-builders-carry-frame-and-fps-params]
+   ["test_xtts_omits_speaker_wav_when_absent" test-xtts-omits-speaker-wav-when-absent]
+   ["test_audio_builders_route_duration_and_seed" test-audio-builders-route-duration-and-seed]])
+
+(def failed (atom 0))
+
+(doseq [[label test-fn] tests]
+  (try
+    (test-fn)
+    (println (str "ok   " label))
+    (catch python/Exception e
+      (swap! failed inc)
+      (println (str "FAIL " label ": " (python/repr e))))))
+
+(println (str (count tests) " test(s), " @failed " failed"))
+(sys/exit (if (pos? @failed) 1 0))
